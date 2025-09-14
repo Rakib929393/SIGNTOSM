@@ -6,15 +6,17 @@ from flask import Flask, request, jsonify, send_from_directory, url_for, render_
 from pypdf import PdfReader
 from PIL import Image
 
+# =======================
+# Flask App Configuration
+# =======================
 app = Flask(__name__)
 
-# Configuration
-UPLOAD_FOLDER = "uploads"
-EXTRACTED_FOLDER = "images"
+UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
+EXTRACTED_FOLDER = os.path.join(os.getcwd(), "images")
 ALLOWED_EXTENSIONS = {"pdf"}
 MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB limit
 
-# Flask JSON settings (pretty print + Unicode + no slash escaping)
+# Flask JSON settings
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
 app.config["JSON_AS_ASCII"] = False  
 
@@ -22,27 +24,30 @@ app.config["JSON_AS_ASCII"] = False
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(EXTRACTED_FOLDER, exist_ok=True)
 
+# =======================
+# Helper Functions
+# =======================
 def generate_random_number(length=30):
-    """Generate a random number string of given length."""
     return ''.join([str(random.randint(0, 9)) for _ in range(length)])
 
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
 def extract_images_from_pdf(pdf_file_path: str, output_path: str):
-    """Extract images from a PDF and rename first two images as user-img and sign-img with 30-digit random numbers."""
+    extracted_files = []
     try:
         reader = PdfReader(pdf_file_path)
         seen_images = set()
-        extracted_files = []
         image_count = 0
 
         for page in reader.pages:
             for image in page.images:
                 image_data = image.data
                 image_hash = hash(image_data)
-
                 if image_hash in seen_images:
                     continue
-
                 seen_images.add(image_hash)
+
                 ext = os.path.splitext(image.name)[1].lower()
 
                 # Convert JP2/JPEG2000 to PNG
@@ -51,79 +56,77 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
                         with Image.open(io.BytesIO(image_data)) as img:
                             if img.mode in ("RGBA", "P"):
                                 img = img.convert("RGB")
-                            image_bytes = io.BytesIO()
-                            img.save(image_bytes, format="PNG")
-                            image_data = image_bytes.getvalue()
+                            img_bytes = io.BytesIO()
+                            img.save(img_bytes, format="PNG")
+                            image_data = img_bytes.getvalue()
                             ext = ".png"
                     except Exception as e:
-                        logging.error(f"Failed to convert JP2 to PNG: {e}")
+                        logging.error(f"JP2 Conversion Failed: {e}")
                         continue
 
-                # Naming logic with 30-digit random numbers
-                random_number = generate_random_number(30)
+                # Naming logic
+                random_number = generate_random_number()
                 if image_count == 0:
-                    image_filename = f"user-img-{random_number}{ext}"
+                    filename = f"user-img-{random_number}{ext}"
                 elif image_count == 1:
-                    image_filename = f"sign-img-{random_number}{ext}"
+                    filename = f"sign-img-{random_number}{ext}"
                 else:
-                    image_filename = f"{random_number}{ext}"
+                    filename = f"{random_number}{ext}"
 
-                file_path = os.path.join(output_path, image_filename)
+                file_path = os.path.join(output_path, filename)
                 with open(file_path, "wb") as fp:
                     fp.write(image_data)
 
-                extracted_files.append(image_filename)
+                extracted_files.append(filename)
                 image_count += 1
 
-        return extracted_files
-
     except Exception as e:
-        logging.error(f"Failed to extract images from {pdf_file_path}: {e}")
-        return []
+        logging.error(f"Failed to extract images: {e}")
+    
+    return extracted_files
 
-# ✅ Helper response wrapper
 def make_response(data: dict, status=200):
-    """Attach TG_Channel at the end and return JSON response with proper formatting."""
-    if "TG_Channel" in data:
-        data.pop("TG_Channel")
+    """Attach TG_Channel and return JSON response"""
     data["TG_Channel"] = "@UNKNOWN_X_1337_BOT"
     return jsonify(data), status
 
+# =======================
+# Routes
+# =======================
 @app.route("/")
 def home():
     return make_response({"status": "Images Extractor Active"})
 
 @app.route("/images", methods=["POST"])
 def upload_file():
-    """Handle file upload and extract images."""
     if "file" not in request.files:
         return make_response({"error": "No file part"}, 400)
 
     file = request.files["file"]
-
     if file.filename == "":
         return make_response({"error": "No selected file"}, 400)
 
-    # Check file size
-    file.seek(0, os.SEEK_END)
-    file_size = file.tell()
-    file.seek(0)
-    if file_size > MAX_FILE_SIZE:
-        return make_response({"error": "File size exceeds 2 MB limit"}, 400)
-
-    # Validate extension
-    if file.filename.split(".")[-1].lower() not in ALLOWED_EXTENSIONS:
+    if not allowed_file(file.filename):
         return make_response({"error": "Invalid file type"}, 400)
 
-    # Save PDF temporarily
-    file_path = os.path.join(UPLOAD_FOLDER, f"{generate_random_number(30)}.pdf")
-    file.save(file_path)
+    # Check file size
+    file.seek(0, os.SEEK_END)
+    size = file.tell()
+    file.seek(0)
+    if size > MAX_FILE_SIZE:
+        return make_response({"error": "File size exceeds 2 MB limit"}, 400)
 
-    extracted_images = extract_images_from_pdf(file_path, EXTRACTED_FOLDER)
+    # Save temporarily
+    pdf_filename = f"{generate_random_number()}.pdf"
+    pdf_path = os.path.join(UPLOAD_FOLDER, pdf_filename)
+    file.save(pdf_path)
 
-    # Delete PDF after processing
+    # Extract images
+    extracted_images = extract_images_from_pdf(pdf_path, EXTRACTED_FOLDER)
+
+    # Delete PDF after extraction
     try:
-        os.remove(file_path)
+        os.remove(pdf_path)
     except Exception as e:
         logging.error(f"Failed to delete PDF: {e}")
 
@@ -133,6 +136,8 @@ def upload_file():
             images_dict["user-image"] = url_for("download_file", filename=extracted_images[0], _external=True)
         if len(extracted_images) >= 2:
             images_dict["sign-image"] = url_for("download_file", filename=extracted_images[1], _external=True)
+        if len(extracted_images) > 2:
+            images_dict["extra-images"] = [url_for("download_file", filename=f, _external=True) for f in extracted_images[2:]]
 
         return make_response({
             "message": "Images extracted successfully",
@@ -144,12 +149,14 @@ def upload_file():
 
 @app.route("/images/<filename>")
 def download_file(filename):
-    """Serve extracted images."""
-    return send_from_directory(EXTRACTED_FOLDER, filename)
+    return send_from_directory(EXTRACTED_FOLDER, filename, as_attachment=True)
 
 @app.route("/upload")
 def upload_page():
     return render_template("index.html")
 
+# =======================
+# Main
+# =======================
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
